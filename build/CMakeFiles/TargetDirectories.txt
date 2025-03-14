@@ -1,0 +1,5 @@
+/home/bigfish/dpp-test/build/CMakeFiles/discord-bot.dir
+/home/bigfish/dpp-test/build/CMakeFiles/edit_cache.dir
+/home/bigfish/dpp-test/build/CMakeFiles/rebuild_cache.dir
+/home/bigfish/dpp-test/build/_deps/nlohmann_json-build/CMakeFiles/edit_cache.dir
+/home/bigfish/dpp-test/build/_deps/nlohmann_json-build/CMakeFiles/rebuild_cache.dir
