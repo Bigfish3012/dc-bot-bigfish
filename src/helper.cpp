@@ -172,7 +172,7 @@ std::string process_openai_response(
     messages.push_back({ {"role", "user"}, {"content", user_message} });
 
     nlohmann::json request_json = {
-        {"model", "gpt-4o"},
+        {"model", "gpt-6-luna"},
         {"messages", messages},
         {"temperature", 1.0}
     };

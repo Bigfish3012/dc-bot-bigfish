@@ -6,6 +6,7 @@
 #include <mutex>
 #include <random>
 #include <unordered_set>
+#include <unistd.h>
 using namespace std;
 
 // 定义支持的代码文件扩展名列表
@@ -295,12 +296,15 @@ int main() {
         // }
     });
 
-    std::thread input_thread(terminal_input_listener, std::ref(bot));
-    bot.start(dpp::st_return);
-    if (input_thread.joinable()) {
-        input_thread.join();
+    if (isatty(STDIN_FILENO)) {
+        std::thread input_thread(terminal_input_listener, std::ref(bot));
+        bot.start(dpp::st_return);
+        if (input_thread.joinable()) {
+            input_thread.join();
+        }
+    } else {
+        bot.start(dpp::st_wait);
     }
-
     std::cout << "[INFO] Bot shutting down cleanly.\n";
     return 0;
 }
