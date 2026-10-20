@@ -10,6 +10,7 @@
         src/main.cpp
         src/helper.cpp
         src/pdf_extract.cpp
+        src/media.cpp
     )
 
     # Find our pre-installed DPP package (using FindDPP.cmake).

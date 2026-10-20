@@ -3,6 +3,7 @@
 
 #include <dpp/dpp.h>
 #include "runtime_limits.h"
+#include "media.h"
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <iostream>
@@ -15,14 +16,6 @@
 #include <utility>
 using namespace std;
 
-class ChatError : public std::runtime_error {
-public:
-    ChatError(std::string detail, std::string user_message)
-        : std::runtime_error(std::move(detail)), user_message_(std::move(user_message)) {}
-    const std::string& user_message() const noexcept { return user_message_; }
-private:
-    std::string user_message_;
-};
 
 bool ends_with(const std::string& str, const std::string& suffix);
 // libcurl must be initialized before any bot/worker threads start.
@@ -39,9 +32,11 @@ std::string download_file_content(const std::string& file_url,
 std::string process_openai_response(
     const std::vector<std::pair<std::string, std::string>>& history,
     const std::string& user_message,
-    const std::string& openai_api_key);
+    const std::string& openai_api_key,
+    const std::vector<InputImage>& images = {});
 std::string call_gpt4_api(const std::string& api_key, const nlohmann::json& request_json);
 std::string parse_chat_response(const std::string& api_response);
+ImageCommand infer_image_command(const std::string& api_key, const std::string& text, bool has_images);
 /**
  * Call the OpenAI Moderation API to check if content is flagged.
  * @param api_key Your OpenAI API Key (Bearer token).
@@ -58,6 +53,9 @@ std::string ensure_valid_utf8(const std::string& input);
 std::string handle_code_file(const std::string& file_url, const std::string& file_extension, const dpp::message_create_t& event);
 enum class ModerationResult { allowed, flagged, error };
 ModerationResult parse_moderation_response(const std::string& response);
-ModerationResult check_content(const std::string& api_key, const std::string& content);
+ModerationResult check_content(const std::string& api_key, const std::string& content,
+                               const std::vector<InputImage>& images = {});
+std::string generate_image(const std::string& api_key, const std::string& prompt,
+                           const std::vector<InputImage>& images = {});
 std::string get_file_extension(const std::string& filename);
 #endif

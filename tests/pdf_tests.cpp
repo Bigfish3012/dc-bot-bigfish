@@ -1,4 +1,5 @@
 #include "../include/runtime_limits.h"
+#include "../include/bot_error.h"
 #include <cassert>
 #include <future>
 #include <iomanip>
@@ -36,9 +37,12 @@ std::string pdf(const std::string& word) {
 }
 
 int main() {
-    assert(extract_text_from_pdf({}).empty());
-    assert(extract_text_from_pdf(std::string(limits::attachment_bytes + 1, 'x')).empty());
-    assert(extract_text_from_pdf("invalid PDF").empty());
+    for (const auto& invalid : {std::string{},std::string(limits::attachment_bytes+1,'x'),std::string("invalid PDF")}) {
+        bool failed=false;
+        try { extract_text_from_pdf(invalid); }
+        catch (const ChatError& error) { failed=!error.user_message().empty(); }
+        assert(failed);
+    }
     std::vector<std::future<void>> tasks;
     for (int i = 0; i < 8; ++i) {
         tasks.push_back(std::async(std::launch::async, [i] {

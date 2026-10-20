@@ -155,86 +155,104 @@ bool is_gpt_channel(dpp::snowflake channel_id) {
     return std::find(GPT_CHANNEL_IDS.begin(), GPT_CHANNEL_IDS.end(), channel_id) != GPT_CHANNEL_IDS.end();
 }
 
-// Background jobs retain message data, never a gateway event or shard pointer.
+// Keep reply delivery failures observable without exposing API response bodies.
+void send_reply(dpp::cluster& bot, const dpp::message& source, const dpp::message& outgoing) {
+    bot.message_create(outgoing, [&bot, channel=source.channel_id, id=source.id](const dpp::confirmation_callback_t& result) {
+        if (!result.is_error()) return;
+        const auto error=result.get_error();
+        std::cerr << "[ERROR] Discord reply failed: message_id=" << id
+                  << " code=" << error.code << " reason=" << error.message << '\n';
+        std::string reason="Discord 拒绝了回复，请检查频道权限或附件大小";
+        if (error.code==50013 || error.code==50001) reason="机器人缺少查看频道、发送消息或发送附件权限";
+        else if (error.code==40005) reason="附件超过 Discord 当前允许的大小";
+        else if (error.code==10008) reason="原消息已被删除，无法引用该消息发送回复";
+        // One plain fallback, with no recursive retry if Discord refuses again.
+        bot.message_create(dpp::message(channel,"发送回复失败："+reason+"（Discord 错误码 "+std::to_string(error.code)+"）。"));
+    });
+}
 void reply_to(dpp::cluster& bot, const dpp::message& source, const std::string& text, bool reference = true) {
-    dpp::message outgoing(source.channel_id, text);
+    dpp::message outgoing(source.channel_id,text);
     if (reference) outgoing.set_reference(source.id);
-    bot.message_create(outgoing);
+    send_reply(bot,source,outgoing);
 }
 
-// Called only by KeyedExecutor. Same-session jobs never overlap.
 void process_message(dpp::cluster& bot, const std::string& api_key,
                      const dpp::message& message, const std::string& key) {
-    std::string input = message.content;
-    std::size_t downloaded = 0;
-    for (const auto& attachment : message.attachments) {
-        const auto extension = get_file_extension(attachment.filename);
-        if (extension != "txt" && extension != "pdf" && !code_extensions.count(extension)) {
-            reply_to(bot, message, "不支持该附件类型，请发送文本、代码或可提取文字的 PDF。");
-            return;
-        }
-        const auto remaining = limits::attachment_total_bytes - downloaded;
-        if (!remaining) {
-            reply_to(bot, message, "附件实际下载总量超出 4 MiB 限制。");
-            return;
-        }
-        auto content = download_file_content(attachment.url, remaining);
-        if (content.empty()) {
-            reply_to(bot, message, "附件下载失败、为空、超出限制或已超时。");
-            return;
-        }
-        if (content.size() > limits::attachment_total_bytes - downloaded) {
-            reply_to(bot, message, "附件实际下载总量超出 4 MiB 限制。");
-            return;
-        }
-        downloaded += content.size();
-        if (extension == "pdf") {
-            content = extract_text_from_pdf(content);
-            if (content.empty()) {
-                reply_to(bot, message, "PDF 无法提取文字、超时或文本超过 64 KiB。");
-                return;
-            }
-        }
-        const std::string prefix = "\n[附件内容]\n";
-        if (prefix.size() > limits::input_bytes - input.size() ||
-            content.size() > limits::input_bytes - input.size() - prefix.size()) {
-            reply_to(bot, message, "合并后的文本超过 64 KiB，请缩短内容。");
-            return;
-        }
-        input += prefix;
-        input += content;
+    auto command=parse_image_command(message.content);
+    if (command.requested && command.prompt.empty()) {
+        throw ChatError("Empty image description","请提供图片描述，例如：!image 一只骑自行车的鹅；附图后可用同一命令编辑图片。");
     }
-    input = ensure_valid_utf8(input);
-    if (input.empty()) {
-        reply_to(bot, message, "请输入有效的 UTF-8 文本或支持的附件。");
+    std::string input=command.requested ? command.prompt : message.content;
+    std::vector<InputImage> images;
+    std::size_t downloaded=0,documents=0;
+    for (const auto& attachment:message.attachments) {
+        const auto extension=get_file_extension(attachment.filename);
+        const bool image=is_image_extension(extension);
+        if (!image && extension!="txt" && extension!="pdf" && !code_extensions.count(extension)) {
+            throw ChatError("Unsupported attachment extension","不支持该附件格式。图片请用 PNG、JPEG、WebP；也支持 TXT、代码和可提取文字的 PDF。");
+        }
+        auto remaining=limits::attachment_total_bytes-downloaded;
+        auto maximum=std::min(remaining,image ? limits::image_input_bytes : limits::attachment_bytes);
+        if (!image) maximum=std::min(maximum,limits::document_total_bytes-documents);
+        if (!maximum) throw ChatError("Attachment aggregate limit exceeded","附件总量超过 16 MiB，或文档总量超过 4 MiB，请减少附件。");
+        auto content=download_file_content(attachment.url,maximum);
+        if (content.empty()) throw ChatError("Downloaded attachment is empty","附件下载成功但内容为空，请重新上传有效文件。");
+        downloaded+=content.size();
+        if (image) {
+            images.push_back(make_input_image(content));
+            continue;
+        }
+        documents+=content.size();
+        if (extension=="pdf") {
+            content=extract_text_from_pdf(content);
+            if (content.empty()) throw ChatError("PDF extraction failed","PDF 提取失败：可能是扫描图片、文件损坏、缺少解析工具，或超过 15 秒/64 KiB 文本限制。");
+        }
+        const std::string prefix="\n[附件内容]\n";
+        if (prefix.size()>limits::input_bytes-input.size() || content.size()>limits::input_bytes-input.size()-prefix.size()) {
+            throw ChatError("Combined text exceeds input limit","正文与文档合并后的文本超过 64 KiB，请缩短内容。");
+        }
+        input+=prefix;
+        input+=content;
+    }
+    if (input.empty() && !images.empty()) input="请描述这些图片的内容。";
+    if (input.empty()) throw ChatError("Empty input","消息中没有文字或支持的附件，请发送文字、图片或文档。");
+    input=ensure_valid_utf8(input);
+    if (input.empty()) throw ChatError("Invalid UTF-8 input","文本不是有效的 UTF-8 编码，请将文件转换为 UTF-8 后重新上传。");
+    const auto moderation=check_content(api_key,input,images);
+    if (moderation==ModerationResult::flagged) {
+        reply_to(bot,message,"本次文字或图片未通过内容审核，机器人将不继续处理。",false);
+        bot.message_delete(message.id,message.channel_id);
         return;
     }
-    // Moderate the complete input, including extracted attachments.
-    const auto moderation = check_content(api_key, input);
-    if (moderation == ModerationResult::error) {
-        reply_to(bot, message, "内容审核服务暂时不可用，本次请求未继续处理，请稍后重试。");
-        return;
+    if (!command.requested && !message.content.empty()) {
+        // Route from the user message, not from instructions inside attached documents.
+        command=infer_image_command(api_key,message.content,!images.empty());
     }
-    if (moderation == ModerationResult::flagged) {
-        reply_to(bot, message, "该消息未通过内容审核，机器人将不作回答。", false);
-        // Delete only after classification succeeded; do not claim success before Discord confirms it.
-        bot.message_delete(message.id, message.channel_id);
-        return;
-    }
-    auto history = snapshot_history(key); // A local copy; no lock spans network I/O.
-    const auto reply = process_openai_response(history, input, api_key);
-    if (!reply.empty()) {
+    if (command.edit_only && images.empty()) throw ChatError("Edit request has no image","编辑图片需要本次消息附带原图，请重新上传图片并说明修改要求，或使用 !edit 修改要求。");
+    std::cerr << "[INFO] Message route: message_id=" << message.id
+              << " route=" << (command.requested ? (images.empty() ? "generate" : "edit") : "chat") << '\n';
+    auto history=snapshot_history(key);
+    if (command.requested) {
+        // Validate before acknowledging, so invalid prompts fail immediately.
+        image_request("unused",input,images);
+        reply_to(bot,message,images.empty() ? "正在生成图片，请稍候。" : "正在编辑图片，请稍候。");
+        const auto png=generate_image(api_key,input,images);
+        dpp::message outgoing(message.channel_id,images.empty() ? "图片已生成。" : "图片已编辑。");
+        outgoing.add_file("image_"+std::to_string(static_cast<uint64_t>(message.id))+".png",png);
+        outgoing.set_reference(message.id);
+        send_reply(bot,message,outgoing);
+        history.emplace_back(history_user_text(message.content),"[已回复图片；图片原文不保存在会话历史中]");
+    } else {
+        const auto reply=process_openai_response(history,input,api_key,images);
         if (reply_needs_attachment(reply)) {
-            dpp::message outgoing(message.channel_id, "回复较长，请查看附件。");
-            outgoing.add_file("response.txt", reply);
+            dpp::message outgoing(message.channel_id,"回复较长，请查看附件。");
+            outgoing.add_file("response.txt",reply);
             outgoing.set_reference(message.id);
-            bot.message_create(outgoing);
-        } else {
-            reply_to(bot, message, reply);
-        }
-        history.emplace_back(history_user_text(message.content), reply);
-        save_history(key, std::move(history));
+            send_reply(bot,message,outgoing);
+        } else reply_to(bot,message,reply);
+        history.emplace_back(history_user_text(message.content),reply);
     }
+    save_history(key,std::move(history));
 }
 
 int main() {
@@ -282,14 +300,17 @@ int main() {
             event.reply("输入过大：最多 5 个附件，合并文本最多 64 KiB。", true);
             return;
         }
-        std::size_t declared_total = 0;
+        std::size_t declared_total = 0, declared_documents = 0;
         for (const auto& attachment : event.msg.attachments) {
-            if (attachment.size > limits::attachment_bytes ||
-                attachment.size > limits::attachment_total_bytes - declared_total) {
-                event.reply("附件过大：单文件最多 2 MiB，总计最多 4 MiB。", true);
+            const bool image=is_image_extension(get_file_extension(attachment.filename));
+            if (attachment.size > (image ? limits::image_input_bytes : limits::attachment_bytes) ||
+                attachment.size > limits::attachment_total_bytes - declared_total ||
+                (!image && attachment.size > limits::document_total_bytes - declared_documents)) {
+                event.reply("附件过大：单图最多 8 MiB，单文档最多 2 MiB，全部附件最多 16 MiB（其中文档最多 4 MiB）。", true);
                 return;
             }
             declared_total += attachment.size;
+            if (!image) declared_documents += attachment.size;
         }
         const auto key = std::to_string(static_cast<uint64_t>(event.msg.guild_id)) + ":" +
                          std::to_string(static_cast<uint64_t>(event.msg.channel_id)) + ":" +
@@ -305,21 +326,34 @@ int main() {
                     }
                     process_message(bot, openai_api_key, message, key);
                 } catch (const ChatError& e) {
-                    std::cerr << "[ERROR] Message task failed: " << e.what() << '\n';
-                    reply_to(bot, message, e.user_message());
+                    std::cerr << "[ERROR] Message task failed: message_id=" << message.id << " reason=" << e.what() << '\n';
+                    reply_to(bot,message,e.user_message());
+                } catch (const nlohmann::json::exception& e) {
+                    std::cerr << "[ERROR] Invalid API data: message_id=" << message.id << " reason=" << e.what() << '\n';
+                    reply_to(bot,message,"处理失败：API 返回的数据格式不符合预期，无法读取结果。请稍后重试，若持续发生请联系管理员。");
+                } catch (const std::bad_alloc&) {
+                    std::cerr << "[ERROR] Out of memory: message_id=" << message.id << '\n';
+                    reply_to(bot,message,"处理失败：机器人内存不足，请减少图片数量或文件大小后重试。");
+                } catch (const std::system_error& e) {
+                    std::cerr << "[ERROR] System failure: message_id=" << message.id << " reason=" << e.what() << '\n';
+                    reply_to(bot,message,"处理失败：系统资源或文件操作发生异常，请联系管理员检查磁盘、权限及系统资源。");
                 } catch (const std::exception& e) {
-                    std::cerr << "[ERROR] Message task failed: " << e.what() << '\n';
-                    reply_to(bot, message, "处理消息时发生错误，请稍后重试。");
+                    std::cerr << "[ERROR] Internal failure: message_id=" << message.id << " reason=" << e.what() << '\n';
+                    reply_to(bot,message,"处理失败：程序出现未预期的内部异常。请向管理员提供消息编号 "+std::to_string(static_cast<uint64_t>(message.id))+"，以便核对具体日志。");
                 } catch (...) {
-                    std::cerr << "[ERROR] Message task failed with unknown exception\n";
+                    std::cerr << "[ERROR] Unknown failure: message_id=" << message.id << '\n';
+                    reply_to(bot,message,"处理失败：发生未知内部异常，请联系管理员并提供本条消息的编号。");
                 }
             });
             if (admitted != KeyedExecutor::Admission::accepted) {
-                event.reply("机器人繁忙或当前会话排队过多，请稍后重试。", true);
+                const std::string reason=admitted==KeyedExecutor::Admission::session_full ?
+                    "当前会话的排队任务过多，请等待之前的请求完成后再发送。" :
+                    (admitted==KeyedExecutor::Admission::stopped ? "机器人正在停止，暂时无法接收任务。" : "机器人任务队列已满，请稍后重试。");
+                event.reply(reason,true);
             }
         } catch (const std::exception& e) {
             std::cerr << "[ERROR] Could not enqueue message: " << e.what() << '\n';
-            event.reply("暂时无法接收新任务，请稍后重试。", true);
+            event.reply("无法接收任务：任务入队时系统资源分配失败，请稍后重试或联系管理员。", true);
         }
     });
 

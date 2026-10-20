@@ -1,6 +1,6 @@
 # dc-bot-bigfish
 
-一个使用 C++17 和 [DPP](https://github.com/brainboxdotcc/DPP) 编写的 Discord 聊天机器人，通过 OpenAI API 生成回复，并支持文本、代码附件和可提取文字的 PDF。
+一个使用 C++17 和 [DPP](https://github.com/brainboxdotcc/DPP) 编写的 Discord 聊天机器人，通过 OpenAI API 生成回复，并支持文本、图片、代码附件和可提取文字的 PDF。
 
 目前已在 Raspberry Pi 5、Debian 13 上完成构建和核心测试。
 
@@ -8,7 +8,8 @@
 
 - 在指定频道进行聊天，按服务器、频道、用户隔离会话历史。
 - 长回复通过 `response.txt` 附件发送；普通回复引用原消息。
-- 支持 TXT、PDF，以及常见代码文件，扩展名不区分大小写。
+- 支持 PNG、JPEG、WebP 图片理解，以及 TXT、PDF 和常见代码文件，扩展名不区分大小写。
+- 可生成图片或基于本次上传的图片进行编辑，结果通过 PNG 附件回复。
 - 对正文与附件提取文本一起进行内容审核；审核服务异常时暂停该次请求。
 - 固定工作线程、有界队列、同会话串行处理，避免并发修改历史。
 - 限制附件、合并文本、API 响应和历史内存占用；网络请求具有超时。
@@ -44,9 +45,12 @@ sudo apt install build-essential cmake git pkg-config libcurl4-openssl-dev poppl
 ```json
 {
   "BOT_TOKEN": "YOUR_DISCORD_BOT_TOKEN",
-  "OPENAI_API_KEY": "YOUR_OPENAI_API_KEY"
+  "OPENAI_API_KEY": "YOUR_OPENAI_API_KEY",
+  "IMAGE_MODEL": "gpt-image-2.5-flare"
 }
 ```
+
+`IMAGE_MODEL` 为可选项，默认 `gpt-image-2.5-flare`，图片输出为 1024×1024 PNG、medium 质量，每次一张。图片接口需要相应模型权限，生成和编辑会产生 API 费用。
 
 `BING_API_KEY` 已不是必填项。`config.json` 已被 `.gitignore` 排除，不要提交实际密钥。
 
@@ -65,6 +69,21 @@ sudo apt install build-essential cmake git pkg-config libcurl4-openssl-dev poppl
 仓库内的频道 ID 是现有部署的值，部署到自己的服务器时需要替换。机器人忽略其他机器人以及包含用户提及的消息。
 
 源码保留了部分 slash command 处理函数，但自动注册代码当前被注释；默认使用指定频道中的普通消息聊天。
+
+## 图片使用方式
+
+| 操作 | 在 Discord 中发送 |
+| --- | --- |
+| 看图 / 识别截图文字 | 上传 PNG、JPG/JPEG 或 WebP，并附上问题；没有文字时会描述图片 |
+| 生成图片 | `画一只骑自行车的鹅，发图片给我`，或 `!image 一只骑自行车的鹅，海边日落，插画风格` |
+| 编辑图片 | 本次消息附图并说 `保留主体，只将背景改成日落海边`；也可用 `!image 把背景改成雪山` 或 `!edit 把背景改成雪山` |
+| 中文命令 | `画图：描述`、`生成图片：描述`、`修改图片：要求` |
+
+无命令前缀的文字会额外调用一次意图识别，区分生成/编辑图片与看图问答、HTML/SVG 代码、工具使用问题，因此增加少量 API 用量和延迟。显式图片命令跳过此步骤；若意图识别失败，会说明原因并提示可用命令。
+
+生成/编辑完成后，机器人发送 `image_消息编号.png`。支持一条消息附带多张图片，总附件数量仍不超过 5。图片会校验文件内容并随文字一起审核。GIF、SVG、HEIC 当前不作为图片输入支持，请转换为 PNG/JPEG/WebP。
+
+图片只参与当次请求，不把 Base64 原文存入历史；继续编辑时请重新附图。模型文本回复仍可记住上一轮文字描述。
 
 ## 编译与启动
 
@@ -91,7 +110,7 @@ cd src
 ./bot
 ```
 
-Makefile 编译 `main.cpp`、`helper.cpp`、`pdf_extract.cpp`，链接 DPP、CURL 和 pthread，自动生成 `.d` 头文件依赖。
+Makefile 编译 `main.cpp`、`helper.cpp`、`pdf_extract.cpp`、`media.cpp`，链接 DPP、CURL 和 pthread，自动生成 `.d` 头文件依赖。
 
 ## 后台运行与更新
 
@@ -133,7 +152,11 @@ journalctl -u dcbot.service -f
 | 每个会话的执行中与排队任务 | 4 |
 | 最长排队时间 | 2 分钟（定义在 `main.cpp`） |
 | 附件数量 | 5 |
-| 单附件 / 下载总量 | 2 MiB / 4 MiB |
+| 单图片 / 单文档 | 8 MiB / 2 MiB |
+| 附件总量 / 其中文档总量 | 16 MiB / 4 MiB |
+| 生成图片 / 图片 API 响应体 | 8 MiB / 16 MiB |
+| 图片生成或编辑超时 | 240 秒 |
+| 图片描述 | 32000 字节 |
 | 正文与附件合并文本 | 64 KiB |
 | 聊天 / 审核响应体 | 1 MiB / 128 KiB |
 | 会话历史 | 最多 128 个会话，每会话 15 轮且不超过 256 KiB |
@@ -146,11 +169,11 @@ journalctl -u dcbot.service -f
 
 ## 故障排查
 
-### “处理消息时发生错误，请稍后重试。”
+### 旧版“处理消息时发生错误，请稍后重试。”
 
-这是 `src/main.cpp` 异常捕获分支中的通用提示，不是模型生成的回答。查看同一时间的 `[ERROR] Message task failed` 获取具体原因。
+这是旧版 `src/main.cpp` 异常捕获分支中的通用提示，不是模型生成的回答。当前版本已改为分类说明原因；未知内部异常会提供消息编号以便核对日志。
 
-已知的通信失败、空正文、模型长度限制、过滤或拒绝会返回各自的具体提示。
+已知错误会返回具体原因，例如 DNS/TLS/连接超时、HTTP 401 密钥无效、403 权限不足、429 限流或余额不足、图片格式错误、PDF 解析失败、空正文、模型长度限制及 Discord 附件发送失败。未知内部异常会附消息编号供管理员对照日志，不向频道泄露密钥、请求正文或服务端原始错误文本。
 
 ### 长请求失败，短聊天正常
 
@@ -187,11 +210,21 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic -pthread \
   -Ibuild/_deps/nlohmann_json-src/include \
   tests/chat_response_tests.cpp \
   build/CMakeFiles/discord-bot.dir/src/helper.cpp.o \
+  build/CMakeFiles/discord-bot.dir/src/media.cpp.o \
   -ldpp -lcurl -o build/local-checks/chat_response_tests
 ./build/local-checks/chat_response_tests
 ```
 
-另有 `tests/pdf_tests.cpp`，用于 Linux 上的 PDF 无效输入、大小限制和并发隔离测试。
+图片模块离线测试（不调用 API）：
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+  -Ibuild/_deps/nlohmann_json-src/include tests/media_tests.cpp src/media.cpp \
+  -o build/local-checks/media_tests
+./build/local-checks/media_tests
+```
+
+`tests/pdf_tests.cpp` 验证 PDF 无效输入、大小限制和并发隔离；设置 `TMPDIR` 可把测试临时文件留在项目内。`tests/image_smoke.cpp` 是手动集成验证工具，会使用根目录配置调用实际 OpenAI API，生成/编辑图片会产生费用，不应作为每次构建的自动测试。
 
 ## 目录
 
@@ -199,7 +232,8 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic -pthread \
 include/             接口、队列、文本工具与资源限制
 src/main.cpp         Discord 事件、任务调度、审核和会话管理
 src/helper.cpp       配置读取、HTTP 请求与 API 响应解析
-src/pdf_extract.cpp  PDF 子进程与临时文件管理
+src/pdf_extract.cpp  PDF 子进程、临时文件与具体失败原因
+src/media.cpp        图片编解码、多模态请求和 API 错误分类
 src/Makefile         独立 Make 构建
 CMakeLists.txt       推荐构建入口
 tests/               并发、文本、响应解析和 PDF 测试
