@@ -1,5 +1,7 @@
 # dc-bot-bigfish
 
+**简体中文** | [English](README.en.md)
+
 一个使用 C++17 和 [DPP](https://github.com/brainboxdotcc/DPP) 编写的 Discord 聊天机器人，通过 OpenAI API 生成回复，并支持文本、图片、代码附件和可提取文字的 PDF。
 
 目前已在 Raspberry Pi 5、Debian 13 上完成构建和核心测试。
