@@ -43,17 +43,34 @@ std::string http_request(const std::string& url, const std::string* body,
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, limits::connect_seconds);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, timeout);
-    curl_easy_setopt(curl.get(), CURLOPT_LOW_SPEED_LIMIT, 32L);
-    curl_easy_setopt(curl.get(), CURLOPT_LOW_SPEED_TIME, 15L);
+    // Downloads should make progress. Non-streaming API requests may legitimately
+    // produce no response bytes while the model is generating; use their total
+    // timeout instead of aborting them after 15 seconds of silence.
+    if (!body) {
+        curl_easy_setopt(curl.get(), CURLOPT_LOW_SPEED_LIMIT, 32L);
+        curl_easy_setopt(curl.get(), CURLOPT_LOW_SPEED_TIME, 15L);
+    }
     curl_easy_setopt(curl.get(), CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(maximum));
     const auto result = curl_easy_perform(curl.get());
     long status = 0;
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
     if (result != CURLE_OK || status < 200 || status >= 300 || response.exceeded) {
+        double total = 0, dns = 0, connected = 0, tls = 0, first_byte = 0;
+        curl_easy_getinfo(curl.get(), CURLINFO_TOTAL_TIME, &total);
+        curl_easy_getinfo(curl.get(), CURLINFO_NAMELOOKUP_TIME, &dns);
+        curl_easy_getinfo(curl.get(), CURLINFO_CONNECT_TIME, &connected);
+        curl_easy_getinfo(curl.get(), CURLINFO_APPCONNECT_TIME, &tls);
+        curl_easy_getinfo(curl.get(), CURLINFO_STARTTRANSFER_TIME, &first_byte);
+        const char* operation = !body ? "attachment" :
+            (url == "https://api.openai.com/v1/moderations" ? "moderation" : "chat");
         // Never log credentials, response bodies or signed attachment URLs.
-        std::cerr << "[ERROR] HTTP request failed: status=" << status
+        std::cerr << "[ERROR] HTTP request failed: operation=" << operation
+                  << " status=" << status << " curl_code=" << static_cast<int>(result)
                   << " curl=" << curl_easy_strerror(result)
-                  << " size_limit=" << response.exceeded << '\n';
+                  << " size_limit=" << response.exceeded
+                  << " total_s=" << total << " dns_s=" << dns
+                  << " connect_s=" << connected << " tls_s=" << tls
+                  << " first_byte_s=" << first_byte << '\n';
         return {};
     }
     return std::move(response.data);
