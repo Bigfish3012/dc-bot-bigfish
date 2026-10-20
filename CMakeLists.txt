@@ -9,11 +9,14 @@
     add_executable(${PROJECT_NAME}
         src/main.cpp
         src/helper.cpp
+        src/pdf_extract.cpp
     )
 
     # Find our pre-installed DPP package (using FindDPP.cmake).
     find_package(DPP REQUIRED)
-    find_package(CURL REQUIRED)
+    find_package(CURL 7.85 REQUIRED)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} Threads::Threads)
 
     # Link the pre-installed DPP package.
     target_link_libraries(${PROJECT_NAME} 

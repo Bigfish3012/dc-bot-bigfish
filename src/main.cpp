@@ -7,6 +7,13 @@
 #include <random>
 #include <unordered_set>
 #include <unistd.h>
+#include <algorithm>
+#include <chrono>
+#include <memory>
+#include <tuple>
+#include "../include/keyed_executor.h"
+#include "../include/runtime_limits.h"
+#include "../include/text_utils.h"
 using namespace std;
 
 // 定义支持的代码文件扩展名列表
@@ -19,22 +26,51 @@ const std::unordered_set<std::string> code_extensions = {
 std::atomic<bool> shutdown_flag(false);
 std::atomic<bool> notified(false);
 std::mutex shutdown_mutex;
-// Store the conversation history for each user
-std::map<dpp::snowflake, std::vector<std::pair<std::string, std::string>>> conversation_history;
+using History = std::vector<std::pair<std::string, std::string>>;
+struct HistoryEntry {
+    History turns;
+    std::chrono::steady_clock::time_point used;
+};
+std::mutex history_mutex;
+std::map<std::string, HistoryEntry> conversation_history;
+
+History snapshot_history(const std::string& key) {
+    std::lock_guard<std::mutex> lock(history_mutex);
+    const auto found = conversation_history.find(key);
+    if (found == conversation_history.end()) return {};
+    found->second.used = std::chrono::steady_clock::now();
+    return found->second.turns;
+}
+
+void save_history(const std::string& key, History history) {
+    std::size_t bytes = 0;
+    for (const auto& turn : history) bytes += turn.first.size() + turn.second.size();
+    while (!history.empty() && (history.size() > 15 || bytes > limits::history_bytes)) {
+        bytes -= history.front().first.size() + history.front().second.size();
+        history.erase(history.begin());
+    }
+    std::lock_guard<std::mutex> lock(history_mutex);
+    if (!conversation_history.count(key) && conversation_history.size() >= limits::history_sessions) {
+        const auto oldest = std::min_element(conversation_history.begin(), conversation_history.end(),
+            [](const auto& a, const auto& b) { return a.second.used < b.second.used; });
+        conversation_history.erase(oldest);
+    }
+    conversation_history[key] = {std::move(history), std::chrono::steady_clock::now()};
+}
 //频道列表, Chanel list
 const std::vector<dpp::snowflake> STARTUP_CHANNEL_IDS = {
     1317398360650547220,    // 大专生 testing
-    1337510629409296519,    // 大专生 bing-search
+    //1337510629409296519,    // 大专生 bing-search
     1337510815846371399,     // 大专生 gpt
-    1104273817846693968,  //AIMS gpt-4
+    //1104273817846693968,  //AIMS gpt-4
 };
 const std::vector<dpp::snowflake> BING_CHANNEL_IDS = { 
-    1337510629409296519  // 大专生 bing
+    //1337510629409296519  // 大专生 bing
 };
 const std::vector<dpp::snowflake> GPT_CHANNEL_IDS = { 
     1317398360650547220,  // 大专生 testing
     1337510815846371399,  // 大专生 gpt
-    1104273817846693968,  //AIMS gpt-4
+    //1104273817846693968,  //AIMS gpt-4
 };
 
 // 上线通知列表
@@ -75,8 +111,7 @@ const std::vector<std::string> shutdown_messages = {
 
 // 随机选择一条通知
 std::string get_random_message(const std::vector<std::string>& messages) {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
+    static thread_local std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<> dis(0, messages.size() - 1);
     return messages[dis(gen)];
 }
@@ -86,10 +121,10 @@ void terminal_input_listener(dpp::cluster& bot) {
     std::string input;
     std::string shutdown_input;
     while (true) {
-        std::getline(std::cin, input);
+        if (!std::getline(std::cin, input)) return;
         if (input == "quit" ) {
             cout << "Are you sure to shutdown the discord bot? [Y/N]" << endl;
-            std::getline(std::cin, shutdown_input);
+            if (!std::getline(std::cin, shutdown_input)) return;
             if(shutdown_input == "Y" || shutdown_input == "y"){
                 std::lock_guard<std::mutex> lock(shutdown_mutex);
                 try {
@@ -120,11 +155,107 @@ bool is_gpt_channel(dpp::snowflake channel_id) {
     return std::find(GPT_CHANNEL_IDS.begin(), GPT_CHANNEL_IDS.end(), channel_id) != GPT_CHANNEL_IDS.end();
 }
 
+// Background jobs retain message data, never a gateway event or shard pointer.
+void reply_to(dpp::cluster& bot, const dpp::message& source, const std::string& text, bool reference = true) {
+    dpp::message outgoing(source.channel_id, text);
+    if (reference) outgoing.set_reference(source.id);
+    bot.message_create(outgoing);
+}
+
+// Called only by KeyedExecutor. Same-session jobs never overlap.
+void process_message(dpp::cluster& bot, const std::string& api_key,
+                     const dpp::message& message, const std::string& key) {
+    std::string input = message.content;
+    std::size_t downloaded = 0;
+    for (const auto& attachment : message.attachments) {
+        const auto extension = get_file_extension(attachment.filename);
+        if (extension != "txt" && extension != "pdf" && !code_extensions.count(extension)) {
+            reply_to(bot, message, "不支持该附件类型，请发送文本、代码或可提取文字的 PDF。");
+            return;
+        }
+        const auto remaining = limits::attachment_total_bytes - downloaded;
+        if (!remaining) {
+            reply_to(bot, message, "附件实际下载总量超出 4 MiB 限制。");
+            return;
+        }
+        auto content = download_file_content(attachment.url, remaining);
+        if (content.empty()) {
+            reply_to(bot, message, "附件下载失败、为空、超出限制或已超时。");
+            return;
+        }
+        if (content.size() > limits::attachment_total_bytes - downloaded) {
+            reply_to(bot, message, "附件实际下载总量超出 4 MiB 限制。");
+            return;
+        }
+        downloaded += content.size();
+        if (extension == "pdf") {
+            content = extract_text_from_pdf(content);
+            if (content.empty()) {
+                reply_to(bot, message, "PDF 无法提取文字、超时或文本超过 64 KiB。");
+                return;
+            }
+        }
+        const std::string prefix = "\n[附件内容]\n";
+        if (prefix.size() > limits::input_bytes - input.size() ||
+            content.size() > limits::input_bytes - input.size() - prefix.size()) {
+            reply_to(bot, message, "合并后的文本超过 64 KiB，请缩短内容。");
+            return;
+        }
+        input += prefix;
+        input += content;
+    }
+    input = ensure_valid_utf8(input);
+    if (input.empty()) {
+        reply_to(bot, message, "请输入有效的 UTF-8 文本或支持的附件。");
+        return;
+    }
+    // Moderate the complete input, including extracted attachments.
+    const auto moderation = check_content(api_key, input);
+    if (moderation == ModerationResult::error) {
+        reply_to(bot, message, "内容审核服务暂时不可用，本次请求未继续处理，请稍后重试。");
+        return;
+    }
+    if (moderation == ModerationResult::flagged) {
+        reply_to(bot, message, "该消息未通过内容审核，机器人将不作回答。", false);
+        // Delete only after classification succeeded; do not claim success before Discord confirms it.
+        bot.message_delete(message.id, message.channel_id);
+        return;
+    }
+    auto history = snapshot_history(key); // A local copy; no lock spans network I/O.
+    const auto reply = process_openai_response(history, input, api_key);
+    if (!reply.empty()) {
+        if (reply_needs_attachment(reply)) {
+            dpp::message outgoing(message.channel_id, "回复较长，请查看附件。");
+            outgoing.add_file("response.txt", reply);
+            outgoing.set_reference(message.id);
+            bot.message_create(outgoing);
+        } else {
+            reply_to(bot, message, reply);
+        }
+        history.emplace_back(history_user_text(message.content), reply);
+        save_history(key, std::move(history));
+    }
+}
+
 int main() {
+    struct CurlRuntime {
+        CURLcode result = curl_global_init(CURL_GLOBAL_DEFAULT);
+        ~CurlRuntime() { if (result == CURLE_OK) curl_global_cleanup(); }
+    } curl_runtime;
+    if (curl_runtime.result != CURLE_OK) {
+        std::cerr << "[ERROR] Could not initialize libcurl\n";
+        return 1;
+    }
+
 
 //************************************************************************************************************************ */
 // Check if there is any API key doesn't exist or empty. 检查是否有任何API KEY 没有设置或者是空的。
 //************************************************************************************************************************ */
+    const auto* curl_version = curl_version_info(CURLVERSION_NOW);
+    if (!(curl_version->features & CURL_VERSION_ASYNCHDNS)) {
+        std::cerr << "[ERROR] libcurl needs asynchronous DNS to enforce threaded request timeouts\n";
+        return 1;
+    }
     std::string openai_api_key, BOT_TOKEN, bing_ai_key;
     if (!load_config("../config.json", BOT_TOKEN, openai_api_key, bing_ai_key)) {
         std::cerr << "Error: Failed to load configuration from config.json" << std::endl;
@@ -135,132 +266,58 @@ int main() {
 
 	dpp::cluster bot(BOT_TOKEN, dpp::i_default_intents | dpp::i_message_content);
     bot.on_log(dpp::utility::cout_logger());
-    bot.on_message_create([&bot, &openai_api_key, &bing_ai_key](const dpp::message_create_t& event) {
+    auto jobs = std::make_shared<KeyedExecutor>(limits::workers, limits::outstanding_jobs,
+                                               limits::jobs_per_session);
+    bot.on_message_create([&bot, &openai_api_key, jobs](const dpp::message_create_t& event) {
+        if (event.msg.author.is_bot() ||
+            (!is_bing_channel(event.msg.channel_id) && !is_gpt_channel(event.msg.channel_id)) ||
+            !event.msg.mentions.empty()) return;
 
-        if (!is_bing_channel(event.msg.channel_id) && !is_gpt_channel(event.msg.channel_id) || event.msg.author.is_bot()) {
-            return;
-        }
-
-        dpp::snowflake user_id = event.msg.author.id;
-        std::string user_message = event.msg.content;
-        auto& history = conversation_history[user_id];
-
-        // Ignore messages with mentions or '@' in content
-        if (!event.msg.mentions.empty()) {
-            std::cout << "[INFO] Ignoring message with mentions.\n" << "[INFO] Username: " << event.msg.author.username << ": " << user_message << std::endl;
-            return;
-        }
-
-        // 1) Check content for moderation
-        bool flagged = is_flagged_content(openai_api_key, user_message);
-        if (flagged) {
-            // Decide how to handle flagged content. For example:
-            event.reply("**警告：违规言辞, 现已删除** Your message appears to contain disallowed or sensitive content, so I deleted it and won't respond.", true);
-            std::cout << "[INFO] 违规言辞 / sensitive content:" << user_message << std::endl;
-            // Optionally, delete the message if you have perms:
-            bot.message_delete(event.msg.id, event.msg.channel_id);
-
-            return; // skip the rest of the logic
-        }
-
-        std::cout << "[INFO] Processing message ID: " << static_cast<uint64_t>(event.msg.id) << "     User name: " << event.msg.author.username << "     ID: "<<static_cast<uint64_t>(user_id) << "     Channel ID: " << static_cast<uint64_t>(event.msg.channel_id) <<std::endl;
-        std::cout << "[INFO] Content/user message: " << event.msg.content <<std::endl;
-
-        //**************************** */
-        // Handle Bing search commands
-        //**************************** */
-        //const std::string SEARCH_BAR = "!search";
         if (is_bing_channel(event.msg.channel_id)) {
-            std::string query = event.msg.content;
-            if (query.empty()) {
-                event.reply("Please provide a search query. Usage: `!search <query>`", true);
-                return;
-            }
-
-            std::string response = call_bing_search_api(bing_ai_key, query);
-            if (response.empty()) {
-                event.reply("Failed to fetch search results from Bing.", true);
-                return;
-            }
-
-            // Parse and send Bing response
-            std::string bing_reply = process_bing_response(response);
-            event.reply(bing_reply.empty() ? "No search results found." : bing_reply, true);
-            std::cout << "BING search:" << bing_reply << std::endl;
+            event.reply("搜索功能暂时停用：Bing Search API 已退役，等待配置新的搜索服务。", true);
             return;
         }
-
-        //******************* */
-        //Handle attachments
-        //******************* */
-        std::string combined_input = user_message;
-        if (!event.msg.attachments.empty()) {
-            for (const auto& attachment : event.msg.attachments) {
-                std::string file_ext = get_file_extension(attachment.filename);
-                //.txt file
-                if (file_ext == "txt") {
-                    std::string file_content = download_file_content(attachment.url);
-                    combined_input += file_content;
-                    if (file_content.empty()) {
-                        event.reply("Failed to process the `.txt` file. Please try again.", true);
+        if (event.msg.content.size() > limits::input_bytes ||
+            event.msg.attachments.size() > limits::attachment_count) {
+            event.reply("输入过大：最多 5 个附件，合并文本最多 64 KiB。", true);
+            return;
+        }
+        std::size_t declared_total = 0;
+        for (const auto& attachment : event.msg.attachments) {
+            if (attachment.size > limits::attachment_bytes ||
+                attachment.size > limits::attachment_total_bytes - declared_total) {
+                event.reply("附件过大：单文件最多 2 MiB，总计最多 4 MiB。", true);
+                return;
+            }
+            declared_total += attachment.size;
+        }
+        const auto key = std::to_string(static_cast<uint64_t>(event.msg.guild_id)) + ":" +
+                         std::to_string(static_cast<uint64_t>(event.msg.channel_id)) + ":" +
+                         std::to_string(static_cast<uint64_t>(event.msg.author.id));
+        const auto queued_at = std::chrono::steady_clock::now();
+        try {
+            // Copy message data only; gateway events/shards may expire while queued.
+            const auto admitted = jobs->submit(key, [&bot, &openai_api_key, message = event.msg, key, queued_at] {
+                try {
+                    if (std::chrono::steady_clock::now() - queued_at > std::chrono::minutes(2)) {
+                        reply_to(bot, message, "等待时间过长，请稍后重新发送。");
                         return;
                     }
-                // PDF file
-                } else if(file_ext == "pdf"){
-                    // Download the PDF file
-                    std::string pdf_content = download_file_content(attachment.url);
-                    if(!pdf_content.empty()){
-                        std::string extracted_text = extract_text_from_pdf(pdf_content);
-                        if(!extracted_text.empty()){
-                            combined_input += extracted_text;
-                            //std::cout << "[DEBUG] Combined Input after PDF processing:\n" << combined_input << std::endl;
-                        }else {
-                            event.reply("Failed to extract content from the PDF file. Please ensure it is a readable PDF. PDF might be image-based/scanned", true);
-                            return;
-                        }
-                    }else{
-                        event.reply("Failed to download the PDF file. Please try again.", true);
-                        return;
-                    }
-                    
-                // Python, C Programming, C++, Java, C#, JS , json file ||| 各种各样的文件后缀
-                }else if (code_extensions.find(file_ext) != code_extensions.end()){
-                    //std::string file_extension = attachment.filename.substr(attachment.filename.find_last_of('.'));
-                    std::string response  = handle_code_file(attachment.url, file_ext, event);
-                    if (!response.empty()) combined_input += response;
-                }else{
-                    //combined_input += "\n[收到文件: " + attachment.filename + ", 暂不支持内容解析]";
-                    combined_input += "\n[Received file name: " + attachment.filename + ", Content parsing is not currently supported]";
-                    event.reply("Sorry, I am currently **ONLY** accepting `.txt` `PDF` `py`, `c`, `cpp`, `java`, `cs`, `js`, `ts`, `rb`, `go`, `rs`, `php`, `swift`, `kt`, `sh`, `pl`, `lua`, `hs`, `scala`, `dart`, `ex`, `erl`, `fs`, `clj`, `groovy`, `m`, `asm`, `s` , `html` files. My owner is too lazy, he didn't work hard to make me better.", true);
-                    std::cout << "[ERROR] Unacceptable file type: " << attachment.filename << std::endl;
-                    return;
+                    process_message(bot, openai_api_key, message, key);
+                } catch (const std::exception& e) {
+                    std::cerr << "[ERROR] Message task failed: " << e.what() << '\n';
+                    reply_to(bot, message, "处理消息时发生错误，请稍后重试。");
+                } catch (...) {
+                    std::cerr << "[ERROR] Message task failed with unknown exception\n";
                 }
+            });
+            if (admitted != KeyedExecutor::Admission::accepted) {
+                event.reply("机器人繁忙或当前会话排队过多，请稍后重试。", true);
             }
-            //return;
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] Could not enqueue message: " << e.what() << '\n';
+            event.reply("暂时无法接收新任务，请稍后重试。", true);
         }
-
-        //******************* */
-        //Normal conversation
-        //******************* */
-        combined_input = ensure_valid_utf8(combined_input);
-        if (combined_input.empty()) {
-            std::cout << "[ERROR] Failed to process the input due to encoding issues. Please try again with valid UTF-8 text.\n" << combined_input << std::endl;
-            event.reply("Failed to process the input due to encoding issues. Please try again with valid UTF-8 text.", true);
-            return;
-        }
-        std::cout << "[DEBUG] Final Combined Input for OpenAI API: " << combined_input << std::endl;
-        std::string bot_reply = process_openai_response(history, combined_input, openai_api_key, event);
-
-        if (!bot_reply.empty()) {
-            event.reply(bot_reply, true);
-            history.emplace_back(combined_input, bot_reply);
-            const size_t MAX_HISTORY = 15;
-            const size_t TRIM_SIZE = 5;
-            if(history.size() > MAX_HISTORY){
-                history.erase(history.begin(), history.begin() + TRIM_SIZE);
-            }
-        } 
-
     });
 
     bot.on_slashcommand([](const dpp::slashcommand_t& event) {
@@ -279,9 +336,7 @@ int main() {
 
     bot.on_ready([&bot](const dpp::ready_t& event) {
         // 确保只执行一次（防止重连时重复发送）
-        static bool notified = false;
-        if (!notified) {
-            notified = true;
+        if (!notified.exchange(true)) {
 
             // 发送上线通知到所有目标频道
             for (const auto& channel_id : STARTUP_CHANNEL_IDS) {
@@ -296,15 +351,19 @@ int main() {
         // }
     });
 
+    // Stop jobs before bot destruction, including during exception unwinding.
+    struct StopJobs {
+        std::shared_ptr<KeyedExecutor> executor;
+        ~StopJobs() { executor->stop(); }
+    } stop_jobs{jobs};
     if (isatty(STDIN_FILENO)) {
-        std::thread input_thread(terminal_input_listener, std::ref(bot));
         bot.start(dpp::st_return);
-        if (input_thread.joinable()) {
-            input_thread.join();
-        }
+        terminal_input_listener(bot);
     } else {
         bot.start(dpp::st_wait);
     }
+    jobs->stop(); // Finish in-flight work while bot and credentials still exist.
+    bot.shutdown();
     std::cout << "[INFO] Bot shutting down cleanly.\n";
     return 0;
 }

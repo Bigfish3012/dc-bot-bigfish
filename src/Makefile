@@ -1,25 +1,24 @@
-# Compiler
-CXX = g++
+CXX      = g++
+CPPFLAGS = -I../include
+CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -pthread
+DEPFLAGS = -MMD -MP
+LDLIBS   = -ldpp -lcurl
+TARGET   = bot
+SRCS     = main.cpp helper.cpp pdf_extract.cpp
+OBJS     = $(SRCS:.cpp=.o)
+DEPS     = $(OBJS:.o=.d)
 
-# Compiler flags
-CXXFLAGS = -std=c++17
-
-# Libraries to link
-LIBS = -ldpp
-
-# Target executable name
-TARGET = bot
-
-# Source files
-SRC = main.cpp
-
-# Default rule to build the target
 all: $(TARGET)
 
-# Rule to build the executable
-$(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC) $(LIBS)
+$(TARGET): $(OBJS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-# Clean rule to remove generated files
+%.o: %.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+-include $(DEPS)
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(OBJS) $(DEPS)
+
+.PHONY: all clean
