@@ -124,17 +124,50 @@ std::string process_openai_response(
 
     nlohmann::json request_json = {
         {"model", "gpt-6-luna"},
-        {"messages", messages},
-        {"max_completion_tokens", 4096}
+        {"messages", messages}
     };
 
     // Call the OpenAI API
     std::string api_response = call_gpt4_api(openai_api_key, request_json);
 
-    if (api_response.empty()) throw std::runtime_error("Chat API request failed");
+    return parse_chat_response(api_response);
+}
+
+std::string parse_chat_response(const std::string& api_response) {
+    if (api_response.empty()) {
+        throw ChatError("Chat API request failed",
+                        "与 OpenAI 通信失败，可能是请求超时或服务错误，请稍后重试。");
+    }
     const auto response = nlohmann::json::parse(api_response);
-    const auto reply = response.at("choices").at(0).at("message").at("content").get<std::string>();
-    if (reply.empty()) throw std::runtime_error("Chat API returned no text");
+    const auto& choice = response.at("choices").at(0);
+    const auto& message = choice.at("message");
+    const auto finish = choice.value("finish_reason", std::string("unknown"));
+    const auto& content = message.at("content");
+    const auto reply = content.is_string() ? content.get<std::string>() : std::string{};
+    const auto usage = response.contains("usage") && response["usage"].is_object()
+        ? response["usage"] : nlohmann::json::object();
+    const auto details = usage.contains("completion_tokens_details") &&
+        usage["completion_tokens_details"].is_object()
+        ? usage["completion_tokens_details"] : nlohmann::json::object();
+    // Metadata only: do not log generated text or hidden reasoning content.
+    std::cerr << "[INFO] Chat response: finish_reason=" << finish
+              << " completion_tokens=" << usage.value("completion_tokens", 0)
+              << " reasoning_tokens=" << details.value("reasoning_tokens", 0)
+              << " text_bytes=" << reply.size() << '\n';
+    if (finish == "length") {
+        throw ChatError("Chat response reached model output limit",
+                        "模型输出达到自身长度限制，回复未完整生成，请拆分任务后重试。");
+    }
+    if (finish == "content_filter" ||
+        (message.contains("refusal") && message["refusal"].is_string() &&
+         !message["refusal"].get<std::string>().empty())) {
+        throw ChatError("Chat response filtered or refused",
+                        "模型未能处理该请求，请调整内容后重试。");
+    }
+    if (reply.empty()) {
+        throw ChatError("Chat API returned no text",
+                        "模型未返回回复正文，请稍后重试或将任务拆分后发送。");
+    }
     return reply;
 }
 

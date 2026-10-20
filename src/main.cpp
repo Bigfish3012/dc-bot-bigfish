@@ -304,6 +304,9 @@ int main() {
                         return;
                     }
                     process_message(bot, openai_api_key, message, key);
+                } catch (const ChatError& e) {
+                    std::cerr << "[ERROR] Message task failed: " << e.what() << '\n';
+                    reply_to(bot, message, e.user_message());
                 } catch (const std::exception& e) {
                     std::cerr << "[ERROR] Message task failed: " << e.what() << '\n';
                     reply_to(bot, message, "处理消息时发生错误，请稍后重试。");

@@ -11,7 +11,18 @@
 #include <vector>
 #include <codecvt>
 #include <locale>
+#include <stdexcept>
+#include <utility>
 using namespace std;
+
+class ChatError : public std::runtime_error {
+public:
+    ChatError(std::string detail, std::string user_message)
+        : std::runtime_error(std::move(detail)), user_message_(std::move(user_message)) {}
+    const std::string& user_message() const noexcept { return user_message_; }
+private:
+    std::string user_message_;
+};
 
 bool ends_with(const std::string& str, const std::string& suffix);
 // libcurl must be initialized before any bot/worker threads start.
@@ -30,6 +41,7 @@ std::string process_openai_response(
     const std::string& user_message,
     const std::string& openai_api_key);
 std::string call_gpt4_api(const std::string& api_key, const nlohmann::json& request_json);
+std::string parse_chat_response(const std::string& api_response);
 /**
  * Call the OpenAI Moderation API to check if content is flagged.
  * @param api_key Your OpenAI API Key (Bearer token).
