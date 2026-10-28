@@ -11,9 +11,13 @@
 #include <chrono>
 #include <memory>
 #include <tuple>
+#include <future>
+#include <cstdint>
+#include <utility>
 #include "../include/keyed_executor.h"
 #include "../include/runtime_limits.h"
 #include "../include/text_utils.h"
+#include "../include/discord_chunks.h"
 using namespace std;
 
 // 定义支持的代码文件扩展名列表
@@ -176,6 +180,46 @@ void reply_to(dpp::cluster& bot, const dpp::message& source, const std::string& 
     send_reply(bot,source,outgoing);
 }
 
+// Only called from a KeyedExecutor worker. Never block a DPP event thread.
+// A callback owns its promise even if confirmation arrives after our timeout.
+void reply_in_chunks(dpp::cluster& bot, const dpp::message& source, const std::string& text) {
+    const auto chunks = split_discord_reply(text);
+    if (chunks.empty())
+        throw ChatError("Discord reply contains no visible text", "模型未返回可显示的文字，请稍后重试。");
+    std::size_t sent = 0;
+    for (const auto& chunk : chunks) {
+        dpp::message outgoing(source.channel_id, chunk);
+        if (sent == 0) outgoing.set_reference(source.id);
+        outgoing.set_allowed_mentions(false, false, false, false, {}, {});
+        auto completion = std::make_shared<std::promise<std::pair<bool, uint32_t>>>();
+        auto confirmed = completion->get_future();
+        try {
+            bot.message_create(outgoing, [completion](const dpp::confirmation_callback_t& result) {
+                const bool ok = !result.is_error();
+                completion->set_value({ok, ok ? 0u : result.get_error().code});
+            });
+        } catch (const std::exception&) {
+            throw ChatError("Could not queue Discord reply after " + std::to_string(sent) + " confirmed chunks",
+                            "回答发送中断，已确认发送 " + std::to_string(sent) + "/" +
+                            std::to_string(chunks.size()) + " 段。");
+        }
+        if (confirmed.wait_for(std::chrono::seconds(60)) != std::future_status::ready)
+            throw ChatError("Discord reply confirmation timed out after " + std::to_string(sent) + " confirmed chunks",
+                            "回答发送确认超时，已确认发送 " + std::to_string(sent) + "/" +
+                            std::to_string(chunks.size()) + " 段；当前段可能稍后到达，后续段已停止发送。");
+        const auto result = confirmed.get();
+        if (!result.first)
+            throw ChatError("Discord reply failed: code=" + std::to_string(result.second) +
+                            " confirmed=" + std::to_string(sent) + "/" + std::to_string(chunks.size()),
+                            "回答发送失败，已确认发送 " + std::to_string(sent) + "/" +
+                            std::to_string(chunks.size()) + " 段（Discord 错误码 " +
+                            std::to_string(result.second) + "）。");
+        ++sent;
+    }
+    std::cerr << "[INFO] Discord reply delivered: message_id=" << source.id
+              << " chunks=" << chunks.size() << " text_units=" << discord_text_length(text) << '\n';
+}
+
 void process_message(dpp::cluster& bot, const std::string& api_key,
                      const dpp::message& message, const std::string& key) {
     auto command=parse_image_command(message.content);
@@ -244,12 +288,7 @@ void process_message(dpp::cluster& bot, const std::string& api_key,
         history.emplace_back(history_user_text(message.content),"[已回复图片；图片原文不保存在会话历史中]");
     } else {
         const auto reply=process_openai_response(history,input,api_key,images);
-        if (reply_needs_attachment(reply)) {
-            dpp::message outgoing(message.channel_id,"回复较长，请查看附件。");
-            outgoing.add_file("response.txt",reply);
-            outgoing.set_reference(message.id);
-            send_reply(bot,message,outgoing);
-        } else reply_to(bot,message,reply);
+        reply_in_chunks(bot,message,reply);
         history.emplace_back(history_user_text(message.content),reply);
     }
     save_history(key,std::move(history));
